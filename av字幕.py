@@ -18,6 +18,7 @@ import re
 import os
 import html
 import json
+import ctypes
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -78,6 +79,13 @@ class AVSubtitleApp:
         self.azure_restart_lock = threading.Lock()
         self.azure_restart_count = 0
         self.azure_restart_in_progress = False
+
+        # 透明字幕浮窗
+        self.overlay_window = None
+        self.overlay_canvas = None
+        self.overlay_text = ""
+        self.overlay_clear_after_id = None
+        self.overlay_transparent_color = "#010203"
 
         # 统计
         self.audio_push_count = 0
@@ -775,18 +783,119 @@ class AVSubtitleApp:
     def _append_chinese(self, text):
         self.chinese_text.insert(tk.END, f"{text}\n")
         self.chinese_text.see(tk.END)
+        self._update_overlay_subtitle(text)
 
     def _set_live_subtitle(self, source_text, zh_text=""):
         if hasattr(self, "source_live_var"):
             self.source_live_var.set(f"实时: {source_text}" if source_text else "")
         if hasattr(self, "chinese_live_var"):
             self.chinese_live_var.set(f"实时: {zh_text}" if zh_text else "")
+        if zh_text:
+            self._update_overlay_subtitle(zh_text, clear_ms=4500)
 
     def _clear_live_subtitle(self):
         if hasattr(self, "source_live_var"):
             self.source_live_var.set("")
         if hasattr(self, "chinese_live_var"):
             self.chinese_live_var.set("")
+
+    # -----------------------------------------------------------------
+    # 透明字幕浮窗
+    # -----------------------------------------------------------------
+
+    def toggle_overlay(self):
+        if self.overlay_window and self.overlay_window.winfo_exists():
+            self.overlay_window.destroy()
+            self.overlay_window = None
+            self.overlay_canvas = None
+            self.overlay_button.config(text="🪟 字幕浮窗")
+            return
+        self._create_overlay()
+        self.overlay_button.config(text="🪟 关闭浮窗")
+        if self.overlay_text:
+            self._draw_overlay_text(self.overlay_text)
+
+    def _create_overlay(self):
+        screen_w = self.root.winfo_screenwidth()
+        screen_h = self.root.winfo_screenheight()
+        width = screen_w
+        height = 190
+        y = max(0, screen_h - height - 90)
+
+        win = tk.Toplevel(self.root)
+        win.overrideredirect(True)
+        win.attributes("-topmost", True)
+        win.configure(bg=self.overlay_transparent_color)
+        try:
+            win.attributes("-transparentcolor", self.overlay_transparent_color)
+        except tk.TclError:
+            win.attributes("-alpha", 0.82)
+        win.geometry(f"{width}x{height}+0+{y}")
+
+        canvas = tk.Canvas(
+            win,
+            bg=self.overlay_transparent_color,
+            highlightthickness=0,
+            bd=0,
+        )
+        canvas.pack(fill=tk.BOTH, expand=True)
+        self.overlay_window = win
+        self.overlay_canvas = canvas
+        win.update_idletasks()
+        self._make_overlay_clickthrough(win)
+
+    def _make_overlay_clickthrough(self, win):
+        if not sys.platform.startswith("win"):
+            return
+        try:
+            hwnd = win.winfo_id()
+            user32 = ctypes.windll.user32
+            gwl_exstyle = -20
+            ws_ex_layered = 0x00080000
+            ws_ex_transparent = 0x00000020
+            ws_ex_noactivate = 0x08000000
+            ws_ex_toolwindow = 0x00000080
+            style = user32.GetWindowLongW(hwnd, gwl_exstyle)
+            style |= ws_ex_layered | ws_ex_transparent | ws_ex_noactivate | ws_ex_toolwindow
+            user32.SetWindowLongW(hwnd, gwl_exstyle, style)
+        except Exception as e:
+            print(f"设置字幕浮窗穿透失败: {e}", flush=True)
+
+    def _draw_overlay_text(self, text):
+        if not self.overlay_canvas or not self.overlay_window or not self.overlay_window.winfo_exists():
+            return
+        canvas = self.overlay_canvas
+        canvas.delete("subtitle")
+        width = max(canvas.winfo_width(), self.root.winfo_screenwidth())
+        height = max(canvas.winfo_height(), 190)
+        x = width // 2
+        y = height // 2
+        font = ("Microsoft YaHei UI", 30, "bold")
+        wrap = max(500, width - 220)
+        for dx, dy in [(-2, -2), (-2, 2), (2, -2), (2, 2), (0, 3)]:
+            canvas.create_text(
+                x + dx, y + dy, text=text, fill="black", font=font,
+                width=wrap, justify=tk.CENTER, tags="subtitle"
+            )
+        canvas.create_text(
+            x, y, text=text, fill="white", font=font,
+            width=wrap, justify=tk.CENTER, tags="subtitle"
+        )
+
+    def _update_overlay_subtitle(self, text, clear_ms=7000):
+        if not text:
+            return
+        self.overlay_text = text
+        if self.overlay_window and self.overlay_window.winfo_exists():
+            self._draw_overlay_text(text)
+            if self.overlay_clear_after_id:
+                self.root.after_cancel(self.overlay_clear_after_id)
+            self.overlay_clear_after_id = self.root.after(clear_ms, self._clear_overlay_text)
+
+    def _clear_overlay_text(self):
+        self.overlay_clear_after_id = None
+        if self.overlay_canvas and self.overlay_window and self.overlay_window.winfo_exists():
+            self.overlay_canvas.delete("subtitle")
 
     @staticmethod
     def clean_text(text):
@@ -1018,7 +1127,7 @@ class AVSubtitleApp:
         self.chinese_live_label.config(font=("SimHei", max(f["text"] - 1, 8)))
         for btn in [self.start_button, self.pause_button, self.resume_button, self.stop_button]:
             btn.config(font=("Arial", f["button"], "bold"))
-        for btn in [self.clear_button, self.view_records_button, self.save_button]:
+        for btn in [self.clear_button, self.view_records_button, self.save_button, self.overlay_button]:
             btn.config(font=("Arial", f["button"]))
         self.status_label.config(font=("Arial", f["label"]))
         self.stats_label.config(font=("Arial", f["label"]))
@@ -1172,6 +1281,10 @@ class AVSubtitleApp:
                                       bg="lightgreen", font=("Arial", f["button"]), width=10, height=2)
         self.save_button.pack(side=tk.LEFT, padx=5)
 
+        self.overlay_button = tk.Button(ctrl, text="🪟 字幕浮窗", command=self.toggle_overlay,
+                                        bg="#e0f2fe", font=("Arial", f["button"]), width=10, height=2)
+        self.overlay_button.pack(side=tk.LEFT, padx=5)
+
         # --- 状态 ---
         self.status_label = tk.Label(self.root, text="状态: 就绪 (AV字幕)",
                                       fg="blue", font=("Arial", f["label"]))
@@ -1257,6 +1370,20 @@ class AVSubtitleApp:
 
         if self.session_records:
             self.auto_save_to_file()
+
+        if self.overlay_clear_after_id:
+            try:
+                self.root.after_cancel(self.overlay_clear_after_id)
+            except Exception:
+                pass
+            self.overlay_clear_after_id = None
+        if self.overlay_window and self.overlay_window.winfo_exists():
+            try:
+                self.overlay_window.destroy()
+            except Exception:
+                pass
+            self.overlay_window = None
+            self.overlay_canvas = None
 
         try:
             self.audio.terminate()
