@@ -1,0 +1,13 @@
+# AV字幕
+# 依赖包列表
+
+# Azure Speech SDK (一体化语音翻译)
+azure-cognitiveservices-speech>=1.35.0
+
+# 音频处理 - WASAPI Loopback 支持 (无需虚拟声卡)
+PyAudioWPatch>=0.2.12
+
+# 数值计算 (音频混合/重采样)
+numpy>=1.24.0
+
+# GUI (tkinter 内置，无需安装)

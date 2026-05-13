@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.pyo
+build/
+dist/
+*.spec
+*.exe
+翻译记录_*.txt
+字幕记录_*.txt
+config_local.py
+.env
