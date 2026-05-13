@@ -7,5 +7,6 @@ dist/
 *.exe
 翻译记录_*.txt
 字幕记录_*.txt
+launch_*.log
 config_local.py
 .env

@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 AV字幕
-- Azure 一体化语音翻译（转录+翻译一步完成，延迟 ~0.3-0.5s）
+- Deepgram 实时语音识别 + Google Translate 翻译
 - WASAPI Loopback + 麦克风双路混合（无需虚拟声卡）
 - Tkinter 双面板实时显示日语原文和中文字幕
 """
@@ -16,11 +16,16 @@ import time
 import re
 import os
 import html
+import json
+import urllib.error
+import urllib.parse
+import urllib.request
 import tkinter as tk
 from tkinter import scrolledtext, messagebox
 from datetime import datetime
 
 import numpy as np
+import websocket
 
 try:
     import pyaudiowpatch as pyaudio
@@ -31,12 +36,11 @@ except ImportError:
     HAS_LOOPBACK = False
     print("⚠️ pyaudiowpatch 未安装，仅支持麦克风输入")
 
-import azure.cognitiveservices.speech as speechsdk
-
 from config import (
-    AZURE_SPEECH_KEY,
-    AZURE_SPEECH_REGION,
     AUDIO_CONFIG,
+    DEEPGRAM_API_KEY,
+    DEEPGRAM_CONFIG,
+    GOOGLE_TRANSLATE_API_KEY,
     TRANSLATION_CONFIG,
     UI_CONFIG,
 )
@@ -55,9 +59,11 @@ class AVSubtitleApp:
         self.is_recording = False
         self.is_paused = False
 
-        # Azure 对象（start 时创建）
-        self.recognizer = None
-        self.push_stream = None
+        # 实时字幕连接（start 时创建）
+        self.ws_app = None
+        self.ws_thread = None
+        self.ws_open = threading.Event()
+        self.last_final_text = ""
 
         # 统计
         self.audio_push_count = 0
@@ -303,7 +309,7 @@ class AVSubtitleApp:
             return None
 
     def audio_capture_thread(self):
-        """双路捕获 → 混合 → 推送到 Azure（自动检测输出设备切换）"""
+        """双路捕获 → 混合 → 推送到 Deepgram（自动检测输出设备切换）"""
         print("🎧 音频捕获线程启动")
 
         # --- 打开 Loopback ---
@@ -356,7 +362,7 @@ class AVSubtitleApp:
             try:
                 if self.is_paused:
                     silence = bytes(TARGET_CHUNK * 2)
-                    self.push_stream.write(silence)
+                    self._send_audio(silence)
                     time.sleep(CHUNK_MS / 1000)
                     continue
 
@@ -419,8 +425,8 @@ class AVSubtitleApp:
                     -32768, 32767
                 ).astype(np.int16)
 
-                # 推送到 Azure
-                self.push_stream.write(mixed.tobytes())
+                # 推送到 Deepgram
+                self._send_audio(mixed.tobytes())
                 self.audio_push_count += 1
 
             except Exception as e:
@@ -445,73 +451,148 @@ class AVSubtitleApp:
             pass
 
     # -----------------------------------------------------------------
-    # Azure 事件回调
+    # Deepgram + Google Translate
     # -----------------------------------------------------------------
 
-    def on_recognizing(self, evt):
-        """临时识别结果（显示在状态栏）"""
-        if self.is_paused:
-            return
-        text = evt.result.text
-        if not text:
-            return
-        # 获取临时翻译
-        translations = evt.result.translations
-        zh = translations.get("zh-Hans", "") if translations else ""
-        display = text[:60] + "..." if len(text) > 60 else text
+    def _deepgram_url(self):
+        params = {
+            "model": DEEPGRAM_CONFIG["MODEL"],
+            "language": TRANSLATION_CONFIG["SOURCE_LANG"],
+            "encoding": "linear16",
+            "sample_rate": str(TARGET_RATE),
+            "channels": "1",
+            "interim_results": "true",
+            "smart_format": "true",
+            "punctuate": "true",
+            "endpointing": str(DEEPGRAM_CONFIG["ENDPOINTING_MS"]),
+        }
+        return "wss://api.deepgram.com/v1/listen?" + urllib.parse.urlencode(params)
+
+    def _start_deepgram(self):
+        self.ws_open.clear()
+        headers = [f"Authorization: Token {DEEPGRAM_API_KEY}"]
+        self.ws_app = websocket.WebSocketApp(
+            self._deepgram_url(),
+            header=headers,
+            on_open=self._on_ws_open,
+            on_message=self._on_ws_message,
+            on_error=self._on_ws_error,
+            on_close=self._on_ws_close,
+        )
+        self.ws_thread = threading.Thread(
+            target=lambda: self.ws_app.run_forever(ping_interval=20, ping_timeout=10),
+            daemon=True,
+        )
+        self.ws_thread.start()
+        if not self.ws_open.wait(timeout=12):
+            raise RuntimeError("Deepgram 连接超时，请检查 API Key 和网络")
+
+    def _send_audio(self, audio_bytes):
+        if self.ws_app and self.ws_open.is_set():
+            try:
+                self.ws_app.send(audio_bytes, opcode=websocket.ABNF.OPCODE_BINARY)
+            except Exception as e:
+                self.ws_open.clear()
+                print(f"发送音频错误: {e}")
+
+    def _stop_deepgram(self):
+        self.ws_open.clear()
+        if self.ws_app:
+            try:
+                self.ws_app.close()
+            except Exception:
+                pass
+        if self.ws_thread and self.ws_thread.is_alive():
+            self.ws_thread.join(timeout=2)
+        self.ws_app = None
+        self.ws_thread = None
+
+    def _on_ws_open(self, ws):
+        print("✅ Deepgram 实时识别已连接")
+        self.ws_open.set()
         self.root.after(0, lambda: self.status_label.config(
-            text=f"🎤 {display}", fg="blue"))
+            text="状态: Deepgram 已连接，正在识别...", fg="green"))
 
-    def on_recognized(self, evt):
-        """最终识别结果 → 显示日语原文 + 中文翻译"""
-        if self.is_paused:
-            return
-        reason = evt.result.reason
-        if reason == speechsdk.ResultReason.TranslatedSpeech:
-            en_text = evt.result.text.strip()
-            translations = evt.result.translations
-            zh_text = translations.get("zh-Hans", "").strip() if translations else ""
+    def _on_ws_close(self, ws, close_status_code, close_msg):
+        print("⏹ Deepgram 连接已关闭")
+        self.ws_open.clear()
 
-            if not en_text:
+    def _on_ws_error(self, ws, error):
+        msg = str(error)
+        print(f"❌ Deepgram 错误: {msg}")
+        self.root.after(0, lambda m=msg: self.status_label.config(
+            text=f"❌ Deepgram 错误: {m[:80]}", fg="red"))
+
+    def _on_ws_message(self, ws, message):
+        try:
+            data = json.loads(message)
+            channel = data.get("channel", {})
+            alternatives = channel.get("alternatives", [])
+            if not alternatives:
+                return
+            text = alternatives[0].get("transcript", "").strip()
+            if not text:
                 return
 
+            display = text[:60] + "..." if len(text) > 60 else text
+            if not data.get("is_final"):
+                self.root.after(0, lambda d=display: self.status_label.config(
+                    text=f"🎤 {d}", fg="blue"))
+                return
+
+            text = self.clean_text(text)
+            if not text or text == self.last_final_text:
+                return
+            self.last_final_text = text
             self.recognition_count += 1
 
-            # 后处理
-            en_text = self.clean_text(en_text)
-            zh_text = self.postprocess_translation(zh_text)
+            threading.Thread(target=self._translate_and_display, args=(text,), daemon=True).start()
+        except Exception as e:
+            print(f"处理识别结果错误: {e}")
 
-            if en_text and zh_text:
-                self.translation_count += 1
-                self.save_record(en_text, zh_text)
+    def _translate_and_display(self, source_text):
+        zh_text = self.translate_text(source_text)
+        zh_text = self.postprocess_translation(zh_text)
+        if not zh_text:
+            return
+        self.translation_count += 1
+        self.save_record(source_text, zh_text)
+        self.root.after(0, lambda e=source_text: self._append_english(e))
+        self.root.after(0, lambda z=zh_text: self._append_chinese(z))
+        self.root.after(0, lambda: self.status_label.config(
+            text="状态: 识别中... (Deepgram + Google Translate)", fg="green"))
+        print(f"🟢 JA: {source_text}")
+        print(f"🟢 ZH: {zh_text}")
 
-                # 显示
-                self.root.after(0, lambda e=en_text: self._append_english(e))
-                self.root.after(0, lambda z=zh_text: self._append_chinese(z))
-                self.root.after(0, lambda: self.status_label.config(
-                    text="状态: 识别中... (Azure Speech Translation)", fg="green"))
-
-                print(f"🟢 JA: {en_text}")
-                print(f"🟢 ZH: {zh_text}")
-
-        elif reason == speechsdk.ResultReason.NoMatch:
-            pass  # 没有匹配，正常
-
-    def on_canceled(self, evt):
-        """识别取消/出错"""
-        cancellation = evt.result.cancellation_details
-        print(f"❌ Azure 取消: {cancellation.reason}")
-        if cancellation.reason == speechsdk.CancellationReason.Error:
-            print(f"   错误码: {cancellation.error_code}")
-            print(f"   详情: {cancellation.error_details}")
+    def translate_text(self, text):
+        params = urllib.parse.urlencode({"key": GOOGLE_TRANSLATE_API_KEY})
+        url = f"https://translation.googleapis.com/language/translate/v2?{params}"
+        body = json.dumps({
+            "q": text,
+            "source": TRANSLATION_CONFIG["SOURCE_LANG"],
+            "target": TRANSLATION_CONFIG["TARGET_LANG"],
+            "format": "text",
+        }, ensure_ascii=False).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=body,
+            headers={"Content-Type": "application/json; charset=UTF-8"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+            return payload["data"]["translations"][0]["translatedText"]
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode("utf-8", errors="replace")[:200]
+            print(f"❌ Google Translate 错误: HTTP {e.code} {detail}")
             self.root.after(0, lambda: self.status_label.config(
-                text=f"❌ Azure 错误: {cancellation.error_details[:80]}", fg="red"))
-
-    def on_session_started(self, evt):
-        print("✅ Azure 会话已建立")
-
-    def on_session_stopped(self, evt):
-        print("⏹ Azure 会话已结束")
+                text=f"❌ 翻译错误: HTTP {e.code}", fg="red"))
+        except Exception as e:
+            print(f"❌ Google Translate 错误: {e}")
+            self.root.after(0, lambda m=str(e): self.status_label.config(
+                text=f"❌ 翻译错误: {m[:80]}", fg="red"))
+        return ""
 
     # -----------------------------------------------------------------
     # 文本处理
@@ -563,14 +644,21 @@ class AVSubtitleApp:
             loop_desc = self.loopback_var.get()
             result = messagebox.askyesno(
                 "确认",
-                "🎤 开始 Azure Speech Translation 实时翻译？\n\n"
+                "🎤 开始 AI 字幕实时翻译？\n\n"
                 f"麦克风: {mic_desc}\n"
                 f"外放源: {loop_desc}\n"
-                "引擎: Azure Speech Translation (一体化低延迟)\n"
+                "引擎: Deepgram 实时识别 + Google Translate\n"
                 "源语言: 日语 → 目标语言: 中文\n\n"
-                "这将产生 Azure API 费用。"
+                "这将产生 API 费用。"
             )
             if not result:
+                return
+
+            if not DEEPGRAM_API_KEY or DEEPGRAM_API_KEY.startswith("YOUR_"):
+                messagebox.showerror("错误", "缺少 Deepgram API Key，请配置 config_local.py")
+                return
+            if not GOOGLE_TRANSLATE_API_KEY or GOOGLE_TRANSLATE_API_KEY.startswith("YOUR_"):
+                messagebox.showerror("错误", "缺少 Google Translate API Key，请配置 config_local.py")
                 return
 
             self.session_start_time = datetime.now()
@@ -579,48 +667,9 @@ class AVSubtitleApp:
             self.recognition_count = 0
             self.translation_count = 0
             self.is_paused = False
+            self.last_final_text = ""
 
-            # 创建 Azure 翻译识别器
-            speech_config = speechsdk.translation.SpeechTranslationConfig(
-                subscription=AZURE_SPEECH_KEY,
-                region=AZURE_SPEECH_REGION,
-            )
-            speech_config.speech_recognition_language = TRANSLATION_CONFIG["SOURCE_LANG"]
-            speech_config.add_target_language(TRANSLATION_CONFIG["TARGET_LANG"])
-            # 降低延迟
-            speech_config.set_property(
-                speechsdk.PropertyId.SpeechServiceConnection_InitialSilenceTimeoutMs, "15000"
-            )
-            speech_config.set_property(
-                speechsdk.PropertyId.SpeechServiceConnection_EndSilenceTimeoutMs, "5000"
-            )
-
-            # 创建 PushAudioInputStream
-            stream_format = speechsdk.audio.AudioStreamFormat(
-                samples_per_second=TARGET_RATE,
-                bits_per_sample=16,
-                channels=1,
-            )
-            self.push_stream = speechsdk.audio.PushAudioInputStream(
-                stream_format=stream_format
-            )
-            audio_config = speechsdk.audio.AudioConfig(stream=self.push_stream)
-
-            # 创建识别器
-            self.recognizer = speechsdk.translation.TranslationRecognizer(
-                translation_config=speech_config,
-                audio_config=audio_config,
-            )
-
-            # 注册回调
-            self.recognizer.recognizing.connect(self.on_recognizing)
-            self.recognizer.recognized.connect(self.on_recognized)
-            self.recognizer.canceled.connect(self.on_canceled)
-            self.recognizer.session_started.connect(self.on_session_started)
-            self.recognizer.session_stopped.connect(self.on_session_stopped)
-
-            # 开始连续识别
-            self.recognizer.start_continuous_recognition()
+            self._start_deepgram()
 
             # 标记录制
             self.is_recording = True
@@ -636,11 +685,12 @@ class AVSubtitleApp:
             self.stop_button.config(state=tk.NORMAL)
             self.mic_menu.config(state=tk.DISABLED)
             self.loopback_menu.config(state=tk.DISABLED)
-            self.status_label.config(text="状态: 正在连接 Azure...", fg="orange")
+            self.status_label.config(text="状态: 正在连接 Deepgram...", fg="orange")
 
-            print("🎤 开始 Azure Speech Translation (双路混合)")
+            print("🎤 开始 AI 字幕 (Deepgram + Google Translate)")
 
         except Exception as e:
+            self.is_recording = False
             print(f"启动错误: {e}")
             import traceback
             traceback.print_exc()
@@ -666,19 +716,8 @@ class AVSubtitleApp:
         self.is_recording = False
         self.is_paused = False
 
-        # 停止 Azure 识别
-        if self.recognizer:
-            try:
-                self.recognizer.stop_continuous_recognition()
-            except Exception as e:
-                print(f"停止识别器错误: {e}")
-
-        # 关闭推送流
-        if self.push_stream:
-            try:
-                self.push_stream.close()
-            except Exception as e:
-                print(f"关闭推送流错误: {e}")
+        # 停止实时识别连接
+        self._stop_deepgram()
 
         # 等待捕获线程结束
         if hasattr(self, 'capture_thread') and self.capture_thread.is_alive():
@@ -703,7 +742,7 @@ class AVSubtitleApp:
                 f"📤 音频推送: {self.audio_push_count}\n"
                 f"📥 识别结果: {self.recognition_count}\n"
                 f"🌐 翻译记录: {self.translation_count}\n"
-                f"🔧 引擎: Azure Speech Translation\n"
+                f"🔧 引擎: Deepgram + Google Translate\n"
                 f"💾 已保存到: {fname}"
             )
 
@@ -724,7 +763,7 @@ class AVSubtitleApp:
                 f.write("🎬 AV字幕 翻译记录\n")
                 f.write("=" * 50 + "\n")
                 f.write(f"会话时间: {self.session_start_time.strftime('%Y-%m-%d %H:%M:%S') if self.session_start_time else '未知'}\n")
-                f.write(f"翻译引擎: Azure Speech Translation (一体化)\n")
+                f.write(f"翻译引擎: Deepgram + Google Translate\n")
                 f.write(f"音频源: 麦克风 + 系统音频 (WASAPI Loopback)\n")
                 f.write(f"总翻译: {self.translation_count} 条\n")
                 f.write("=" * 50 + "\n\n")
@@ -831,7 +870,7 @@ class AVSubtitleApp:
         self.theme_button.pack(side=tk.LEFT, padx=5)
 
         # 引擎标签
-        tk.Label(settings, text="AV字幕: 日语 → 中文 (Azure Speech Translation)",
+        tk.Label(settings, text="AI字幕: 日语 → 中文 (Deepgram + Google Translate)",
                  font=("Arial", 9), bg="lightgray", fg="green").pack(side=tk.RIGHT, padx=10)
 
         # --- 音频设备选择区 ---
@@ -935,7 +974,7 @@ class AVSubtitleApp:
         # 右 - 中文
         right = tk.Frame(content)
         right.grid(row=0, column=1, sticky="nsew", padx=(10, 0))
-        self.chinese_title = tk.Label(right, text=f"🇨🇳 中文翻译 ({cw}%) - Azure",
+        self.chinese_title = tk.Label(right, text=f"🇨🇳 中文翻译 ({cw}%)",
                                        font=("Arial", f["title"], "bold"))
         self.chinese_title.pack(pady=5)
         self.chinese_text = scrolledtext.ScrolledText(right, wrap=tk.WORD,
@@ -952,7 +991,7 @@ class AVSubtitleApp:
     def run(self):
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
         print("🚀 AV字幕 启动")
-        print(f"   引擎: Azure Speech Translation (一体化)")
+        print(f"   引擎: Deepgram + Google Translate")
         print(f"   语言: 日语 → 中文")
         print(f"   音频: 麦克风 + 系统音频 WASAPI Loopback")
         print(f"   Loopback 支持: {'✅ 是' if HAS_LOOPBACK else '❌ 否'}")
@@ -963,16 +1002,7 @@ class AVSubtitleApp:
         if self.is_recording:
             self.is_recording = False
             self.is_paused = False
-            if self.recognizer:
-                try:
-                    self.recognizer.stop_continuous_recognition()
-                except Exception:
-                    pass
-            if self.push_stream:
-                try:
-                    self.push_stream.close()
-                except Exception:
-                    pass
+            self._stop_deepgram()
             if hasattr(self, 'capture_thread') and self.capture_thread.is_alive():
                 self.capture_thread.join(timeout=2)
 

@@ -1,8 +1,8 @@
 # AV字幕
 # 依赖包列表
 
-# Azure Speech SDK (一体化语音翻译)
-azure-cognitiveservices-speech>=1.35.0
+# Deepgram 实时语音识别 WebSocket 客户端
+websocket-client>=1.8.0
 
 # 音频处理 - WASAPI Loopback 支持 (无需虚拟声卡)
 PyAudioWPatch>=0.2.12

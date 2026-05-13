@@ -1,6 +1,6 @@
 # AV字幕
 
-日语转中文字幕工具。使用 Azure Speech Translation 进行实时语音识别和翻译，支持同时捕获麦克风与系统播放声音。
+日语转中文字幕工具。使用 Deepgram 进行实时语音识别，使用 Google Translate 翻译为简体中文，支持同时捕获麦克风与系统播放声音。
 
 ## 功能
 
@@ -19,19 +19,19 @@ pip install -r requirements.txt
 
 ## 配置
 
-在 Azure Portal 创建 Speech Service 资源后，把 API Key 和 Region 填入 `config.py`：
+建议把 API Key 写入本地 `config_local.py`，这个文件已被 `.gitignore` 忽略，不会提交到 GitHub：
 
 ```python
-AZURE_SPEECH_KEY_1 = "your_key_here"
-AZURE_SPEECH_REGION = "southeastasia"
+DEEPGRAM_API_KEY = "your_deepgram_key"
+GOOGLE_TRANSLATE_API_KEY = "your_google_translate_key"
 ```
 
 默认语言配置：
 
 ```python
 TRANSLATION_CONFIG = {
-    "SOURCE_LANG": "ja-JP",
-    "TARGET_LANG": "zh-Hans",
+    "SOURCE_LANG": "ja",
+    "TARGET_LANG": "zh-CN",
 }
 ```
 
