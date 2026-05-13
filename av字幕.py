@@ -819,9 +819,8 @@ class AVSubtitleApp:
         self.overlay_enabled = True
         self._create_overlay()
         self.overlay_button.config(text="🪟 关闭浮窗")
-        if self.overlay_text:
-            self._draw_overlay_text(self.overlay_text)
-            self.overlay_window.deiconify()
+        preview = self.overlay_text or "字幕浮窗已开启，等待翻译字幕"
+        self._update_overlay_subtitle(preview, clear_ms=3000)
 
     def _create_overlay(self):
         screen_w = self.root.winfo_screenwidth()
@@ -860,14 +859,23 @@ class AVSubtitleApp:
         try:
             hwnd = win.winfo_id()
             user32 = ctypes.windll.user32
+            if hasattr(user32, "GetWindowLongPtrW"):
+                get_window_long = user32.GetWindowLongPtrW
+                set_window_long = user32.SetWindowLongPtrW
+            else:
+                get_window_long = user32.GetWindowLongW
+                set_window_long = user32.SetWindowLongW
             gwl_exstyle = -20
             ws_ex_layered = 0x00080000
             ws_ex_transparent = 0x00000020
             ws_ex_noactivate = 0x08000000
             ws_ex_toolwindow = 0x00000080
-            style = user32.GetWindowLongW(hwnd, gwl_exstyle)
+            lwa_colorkey = 0x00000001
+            colorref_magenta = 0x00FF00FF
+            style = get_window_long(hwnd, gwl_exstyle)
             style |= ws_ex_layered | ws_ex_transparent | ws_ex_noactivate | ws_ex_toolwindow
-            user32.SetWindowLongW(hwnd, gwl_exstyle, style)
+            set_window_long(hwnd, gwl_exstyle, style)
+            user32.SetLayeredWindowAttributes(hwnd, colorref_magenta, 255, lwa_colorkey)
         except Exception as e:
             print(f"设置字幕浮窗穿透失败: {e}", flush=True)
 
@@ -877,6 +885,8 @@ class AVSubtitleApp:
         canvas = self.overlay_canvas
         self.overlay_window.deiconify()
         self.overlay_window.lift()
+        self.overlay_window.attributes("-topmost", True)
+        self._make_overlay_clickthrough(self.overlay_window)
         canvas.delete("subtitle")
         width = max(canvas.winfo_width(), self.root.winfo_screenwidth())
         height = max(canvas.winfo_height(), 160)
