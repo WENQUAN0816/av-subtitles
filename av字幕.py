@@ -73,6 +73,11 @@ class AVSubtitleApp:
         self.recognizer = None
         self.push_stream = None
         self.active_engine = SUBTITLE_ENGINE
+        self.last_recognition_event_time = time.time()
+        self.last_audio_level = 0
+        self.azure_restart_lock = threading.Lock()
+        self.azure_restart_count = 0
+        self.azure_restart_in_progress = False
 
         # 统计
         self.audio_push_count = 0
@@ -90,6 +95,12 @@ class AVSubtitleApp:
         # 用户选择的设备（None = 自动）
         self.selected_mic_index = None
         self.selected_loopback_index = None
+
+        # 源语言选项：Azure 使用完整区域码，备用引擎使用短码
+        self.language_options = {
+            "日语": ("ja-JP", "ja"),
+            "英语": ("en-US", "en"),
+        }
 
         # 字体配置
         self.font_sizes = {
@@ -433,8 +444,9 @@ class AVSubtitleApp:
                     mic_samples.astype(np.int32) + loop_samples.astype(np.int32),
                     -32768, 32767
                 ).astype(np.int16)
+                self.last_audio_level = int(np.max(np.abs(mixed.astype(np.int32))))
 
-                # 推送到 Deepgram
+                # 推送到当前识别引擎
                 self._send_audio(mixed.tobytes())
                 self.audio_push_count += 1
 
@@ -468,12 +480,30 @@ class AVSubtitleApp:
             return "Azure Speech Translation"
         return "Deepgram + Google Translate"
 
+    def _source_language_name(self):
+        if hasattr(self, "language_var"):
+            return self.language_var.get()
+        for name, values in self.language_options.items():
+            if values[0] == AZURE_TRANSLATION_CONFIG["SOURCE_LANG"]:
+                return name
+        return "日语"
+
+    def _azure_source_lang(self):
+        return self.language_options.get(self._source_language_name(), self.language_options["日语"])[0]
+
+    def _short_source_lang(self):
+        return self.language_options.get(self._source_language_name(), self.language_options["日语"])[1]
+
+    def _update_language_titles(self, *_):
+        if hasattr(self, "english_title"):
+            self.english_title.config(text=f"{self._source_language_name()}识别")
+
     def _start_azure(self):
         speech_config = speechsdk.translation.SpeechTranslationConfig(
             subscription=AZURE_SPEECH_KEY,
             region=AZURE_SPEECH_REGION,
         )
-        speech_config.speech_recognition_language = AZURE_TRANSLATION_CONFIG["SOURCE_LANG"]
+        speech_config.speech_recognition_language = self._azure_source_lang()
         speech_config.add_target_language(AZURE_TRANSLATION_CONFIG["TARGET_LANG"])
         speech_config.set_property(
             speechsdk.PropertyId.SpeechServiceConnection_InitialSilenceTimeoutMs, "15000"
@@ -496,8 +526,8 @@ class AVSubtitleApp:
         self.recognizer.recognizing.connect(self._on_azure_recognizing)
         self.recognizer.recognized.connect(self._on_azure_recognized)
         self.recognizer.canceled.connect(self._on_azure_canceled)
-        self.recognizer.session_started.connect(lambda evt: print("✅ Azure 会话已建立"))
-        self.recognizer.session_stopped.connect(lambda evt: print("⏹ Azure 会话已结束"))
+        self.recognizer.session_started.connect(lambda evt: print("✅ Azure 会话已建立", flush=True))
+        self.recognizer.session_stopped.connect(self._on_azure_session_stopped)
         self.recognizer.start_continuous_recognition()
 
     def _stop_azure(self):
@@ -520,15 +550,21 @@ class AVSubtitleApp:
         text = evt.result.text
         if not text:
             return
+        self.last_recognition_event_time = time.time()
+        translations = evt.result.translations
+        zh_text = translations.get(AZURE_TRANSLATION_CONFIG["TARGET_LANG"], "") if translations else ""
         display = text[:60] + "..." if len(text) > 60 else text
-        self.root.after(0, lambda d=display: self.status_label.config(
-            text=f"🎤 {d}", fg="blue"))
+        self.root.after(0, lambda s=text, z=zh_text, d=display: (
+            self._set_live_subtitle(s, z),
+            self.status_label.config(text=f"🎤 {d}", fg="blue")
+        ))
 
     def _on_azure_recognized(self, evt):
         if self.is_paused:
             return
         if evt.result.reason != speechsdk.ResultReason.TranslatedSpeech:
             return
+        self.last_recognition_event_time = time.time()
         source_text = self.clean_text(evt.result.text.strip())
         translations = evt.result.translations
         zh_text = translations.get(AZURE_TRANSLATION_CONFIG["TARGET_LANG"], "").strip() if translations else ""
@@ -540,24 +576,51 @@ class AVSubtitleApp:
         self.save_record(source_text, zh_text)
         self.root.after(0, lambda e=source_text: self._append_english(e))
         self.root.after(0, lambda z=zh_text: self._append_chinese(z))
-        self.root.after(0, lambda: self.status_label.config(
-            text="状态: 识别中... (Azure Speech Translation)", fg="green"))
-        print(f"🟢 JA: {source_text}")
-        print(f"🟢 ZH: {zh_text}")
+        self.root.after(0, lambda: (
+            self._clear_live_subtitle(),
+            self.status_label.config(text="状态: 识别中... (Azure Speech Translation)", fg="green")
+        ))
+        print(f"🟢 SRC: {source_text}", flush=True)
+        print(f"🟢 ZH: {zh_text}", flush=True)
 
     def _on_azure_canceled(self, evt):
         cancellation = evt.result.cancellation_details
-        print(f"❌ Azure 取消: {cancellation.reason}")
+        print(f"❌ Azure 取消: {cancellation.reason}", flush=True)
         if cancellation.reason == speechsdk.CancellationReason.Error:
-            print(f"   错误码: {cancellation.error_code}")
-            print(f"   详情: {cancellation.error_details}")
+            print(f"   错误码: {cancellation.error_code}", flush=True)
+            print(f"   详情: {cancellation.error_details}", flush=True)
             self.root.after(0, lambda: self.status_label.config(
                 text=f"❌ Azure 错误: {cancellation.error_details[:80]}", fg="red"))
+
+    def _on_azure_session_stopped(self, evt):
+        print("⏹ Azure 会话已结束", flush=True)
+        if self.is_recording and self.active_engine == "azure" and not self.azure_restart_in_progress:
+            self.root.after(0, lambda: self.status_label.config(
+                text="Azure 会话结束，正在自动重连...", fg="orange"))
+            threading.Thread(target=self._restart_azure, daemon=True).start()
+
+    def _restart_azure(self):
+        if not self.is_recording or self.active_engine != "azure":
+            return
+        with self.azure_restart_lock:
+            if not self.is_recording or self.active_engine != "azure":
+                return
+            self.azure_restart_in_progress = True
+            self.azure_restart_count += 1
+            print(f"🔄 Azure 自动重连 #{self.azure_restart_count}", flush=True)
+            try:
+                self._stop_azure()
+                time.sleep(0.5)
+                if self.is_recording and self.active_engine == "azure":
+                    self._start_azure()
+                    self.last_recognition_event_time = time.time()
+            finally:
+                self.azure_restart_in_progress = False
 
     def _deepgram_url(self):
         params = {
             "model": DEEPGRAM_CONFIG["MODEL"],
-            "language": TRANSLATION_CONFIG["SOURCE_LANG"],
+            "language": self._short_source_lang(),
             "encoding": "linear16",
             "sample_rate": str(TARGET_RATE),
             "channels": "1",
@@ -590,7 +653,10 @@ class AVSubtitleApp:
     def _send_audio(self, audio_bytes):
         if self.active_engine == "azure":
             if self.push_stream:
-                self.push_stream.write(audio_bytes)
+                try:
+                    self.push_stream.write(audio_bytes)
+                except Exception as e:
+                    print(f"Azure 推送音频错误: {e}", flush=True)
             return
         if self.ws_app and self.ws_open.is_set():
             try:
@@ -673,7 +739,7 @@ class AVSubtitleApp:
         url = f"https://translation.googleapis.com/language/translate/v2?{params}"
         body = json.dumps({
             "q": text,
-            "source": TRANSLATION_CONFIG["SOURCE_LANG"],
+            "source": self._short_source_lang(),
             "target": TRANSLATION_CONFIG["TARGET_LANG"],
             "format": "text",
         }, ensure_ascii=False).encode("utf-8")
@@ -709,6 +775,18 @@ class AVSubtitleApp:
     def _append_chinese(self, text):
         self.chinese_text.insert(tk.END, f"{text}\n")
         self.chinese_text.see(tk.END)
+
+    def _set_live_subtitle(self, source_text, zh_text=""):
+        if hasattr(self, "source_live_var"):
+            self.source_live_var.set(f"实时: {source_text}" if source_text else "")
+        if hasattr(self, "chinese_live_var"):
+            self.chinese_live_var.set(f"实时: {zh_text}" if zh_text else "")
+
+    def _clear_live_subtitle(self):
+        if hasattr(self, "source_live_var"):
+            self.source_live_var.set("")
+        if hasattr(self, "chinese_live_var"):
+            self.chinese_live_var.set("")
 
     @staticmethod
     def clean_text(text):
@@ -752,7 +830,7 @@ class AVSubtitleApp:
                 f"麦克风: {mic_desc}\n"
                 f"外放源: {loop_desc}\n"
                 f"引擎: {self._engine_label()}\n"
-                "源语言: 日语 → 目标语言: 中文\n\n"
+                f"源语言: {self._source_language_name()} → 目标语言: 中文\n\n"
                 "这将产生 API 费用。"
             )
             if not result:
@@ -776,6 +854,10 @@ class AVSubtitleApp:
             self.translation_count = 0
             self.is_paused = False
             self.last_final_text = ""
+            self.last_recognition_event_time = time.time()
+            self.last_audio_level = 0
+            self.azure_restart_count = 0
+            self._clear_live_subtitle()
 
             if self.active_engine == "azure":
                 self._start_azure()
@@ -796,6 +878,7 @@ class AVSubtitleApp:
             self.stop_button.config(state=tk.NORMAL)
             self.mic_menu.config(state=tk.DISABLED)
             self.loopback_menu.config(state=tk.DISABLED)
+            self.language_menu.config(state=tk.DISABLED)
             self.status_label.config(text=f"状态: 正在连接 {self._engine_label()}...", fg="orange")
 
             print(f"🎤 开始 AI 字幕 ({self._engine_label()})")
@@ -844,7 +927,9 @@ class AVSubtitleApp:
         self.stop_button.config(state=tk.DISABLED)
         self.mic_menu.config(state=tk.NORMAL)
         self.loopback_menu.config(state=tk.NORMAL)
+        self.language_menu.config(state=tk.NORMAL)
         self.status_label.config(text="状态: 已停止 (可重新开始)", fg="gray")
+        self._clear_live_subtitle()
 
         # 自动保存
         if self.session_records:
@@ -929,6 +1014,8 @@ class AVSubtitleApp:
         f = self.font_sizes[self.current_font_size]
         self.english_text.config(font=("Yu Gothic UI", f["text"]))
         self.chinese_text.config(font=("SimHei", f["text"]))
+        self.source_live_label.config(font=("Yu Gothic UI", max(f["text"] - 1, 8)))
+        self.chinese_live_label.config(font=("SimHei", max(f["text"] - 1, 8)))
         for btn in [self.start_button, self.pause_button, self.resume_button, self.stop_button]:
             btn.config(font=("Arial", f["button"], "bold"))
         for btn in [self.clear_button, self.view_records_button, self.save_button]:
@@ -944,15 +1031,31 @@ class AVSubtitleApp:
         for widget in [self.english_text, self.chinese_text]:
             widget.config(bg=t["bg"], fg=t["fg"], insertbackground=t["insert"])
         if self.is_dark_theme:
+            self.source_live_label.config(fg="#93c5fd")
+            self.chinese_live_label.config(fg="#86efac")
+        else:
+            self.source_live_label.config(fg="#2563eb")
+            self.chinese_live_label.config(fg="#16a34a")
+        if self.is_dark_theme:
             self.theme_button.config(text="☀️ 亮色", bg="lightblue")
         else:
             self.theme_button.config(text="🌓 反色", bg="lightyellow")
 
     def update_stats(self):
         self.stats_label.config(
-            text=f"音频推送: {self.audio_push_count} | 识别: {self.recognition_count} | 翻译: {self.translation_count}"
+            text=f"音频推送: {self.audio_push_count} | 音量: {self.last_audio_level} | 识别: {self.recognition_count} | 翻译: {self.translation_count}"
         )
         self.root.after(1000, self.update_stats)
+
+    def azure_watchdog(self):
+        if self.is_recording and self.active_engine == "azure":
+            idle = time.time() - self.last_recognition_event_time
+            if self.audio_push_count > 30 and self.last_audio_level > 700 and idle > 25:
+                self.last_recognition_event_time = time.time()
+                self.root.after(0, lambda: self.status_label.config(
+                    text="Azure 长时间无返回，正在自动重连...", fg="orange"))
+                threading.Thread(target=self._restart_azure, daemon=True).start()
+        self.root.after(5000, self.azure_watchdog)
 
     # -----------------------------------------------------------------
     # UI 构建
@@ -982,6 +1085,22 @@ class AVSubtitleApp:
         self.theme_button = tk.Button(theme_frame, text="🌓 反色", command=self.toggle_theme,
                                       bg="lightyellow", font=("Arial", 10, "bold"), width=8, relief=tk.RAISED, bd=2)
         self.theme_button.pack(side=tk.LEFT, padx=5)
+
+        # 源语言
+        lang_frame = tk.Frame(settings, bg="lightgray")
+        lang_frame.pack(side=tk.LEFT, padx=10, pady=5)
+        tk.Label(lang_frame, text="源语言:", font=("Arial", 10), bg="lightgray").pack(side=tk.LEFT)
+        default_lang = "日语"
+        for name, values in self.language_options.items():
+            if values[0] == AZURE_TRANSLATION_CONFIG["SOURCE_LANG"]:
+                default_lang = name
+        self.language_var = tk.StringVar(value=default_lang)
+        self.language_menu = tk.OptionMenu(
+            lang_frame, self.language_var, *self.language_options.keys(),
+            command=self._update_language_titles
+        )
+        self.language_menu.config(font=("Arial", 9), width=6)
+        self.language_menu.pack(side=tk.LEFT, padx=5)
 
         # 引擎标签
         tk.Label(settings, text=f"AI字幕: 日语 → 中文 ({self._engine_label()})",
@@ -1077,9 +1196,15 @@ class AVSubtitleApp:
         # 左 - 日语原文
         left = tk.Frame(content)
         left.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
-        self.english_title = tk.Label(left, text=f"🇯🇵 日语识别 ({ew}%)",
+        self.english_title = tk.Label(left, text=f"{self._source_language_name()}识别",
                                        font=("Arial", f["title"], "bold"))
         self.english_title.pack(pady=5)
+        self.source_live_var = tk.StringVar(value="")
+        self.source_live_label = tk.Label(
+            left, textvariable=self.source_live_var, anchor="w", justify=tk.LEFT,
+            font=("Yu Gothic UI", max(f["text"] - 1, 8)), fg="#2563eb", wraplength=480
+        )
+        self.source_live_label.pack(fill=tk.X, pady=(0, 4))
         self.english_text = scrolledtext.ScrolledText(left, wrap=tk.WORD,
                                                        font=("Yu Gothic UI", f["text"]), height=16,
                                                        bg=theme["bg"], fg=theme["fg"], insertbackground=theme["insert"])
@@ -1091,12 +1216,19 @@ class AVSubtitleApp:
         self.chinese_title = tk.Label(right, text=f"🇨🇳 中文翻译 ({cw}%)",
                                        font=("Arial", f["title"], "bold"))
         self.chinese_title.pack(pady=5)
+        self.chinese_live_var = tk.StringVar(value="")
+        self.chinese_live_label = tk.Label(
+            right, textvariable=self.chinese_live_var, anchor="w", justify=tk.LEFT,
+            font=("SimHei", max(f["text"] - 1, 8)), fg="#16a34a", wraplength=640
+        )
+        self.chinese_live_label.pack(fill=tk.X, pady=(0, 4))
         self.chinese_text = scrolledtext.ScrolledText(right, wrap=tk.WORD,
                                                        font=("SimHei", f["text"]), height=16,
                                                        bg=theme["bg"], fg=theme["fg"], insertbackground=theme["insert"])
         self.chinese_text.pack(fill=tk.BOTH, expand=True)
 
         self.update_stats()
+        self.azure_watchdog()
 
     # -----------------------------------------------------------------
     # 运行 & 关闭
