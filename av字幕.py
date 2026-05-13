@@ -83,9 +83,10 @@ class AVSubtitleApp:
         # 透明字幕浮窗
         self.overlay_window = None
         self.overlay_canvas = None
+        self.overlay_enabled = False
         self.overlay_text = ""
         self.overlay_clear_after_id = None
-        self.overlay_transparent_color = "#010203"
+        self.overlay_transparent_color = "#ff00ff"
 
         # 统计
         self.audio_push_count = 0
@@ -804,33 +805,43 @@ class AVSubtitleApp:
     # -----------------------------------------------------------------
 
     def toggle_overlay(self):
-        if self.overlay_window and self.overlay_window.winfo_exists():
-            self.overlay_window.destroy()
+        if self.overlay_enabled:
+            self.overlay_enabled = False
+            if self.overlay_clear_after_id:
+                self.root.after_cancel(self.overlay_clear_after_id)
+                self.overlay_clear_after_id = None
+            if self.overlay_window and self.overlay_window.winfo_exists():
+                self.overlay_window.destroy()
             self.overlay_window = None
             self.overlay_canvas = None
             self.overlay_button.config(text="🪟 字幕浮窗")
             return
+        self.overlay_enabled = True
         self._create_overlay()
         self.overlay_button.config(text="🪟 关闭浮窗")
         if self.overlay_text:
             self._draw_overlay_text(self.overlay_text)
+            self.overlay_window.deiconify()
 
     def _create_overlay(self):
         screen_w = self.root.winfo_screenwidth()
         screen_h = self.root.winfo_screenheight()
         width = screen_w
-        height = 190
-        y = max(0, screen_h - height - 90)
+        height = 160
+        y = max(0, screen_h - height - 110)
 
         win = tk.Toplevel(self.root)
+        win.withdraw()
         win.overrideredirect(True)
         win.attributes("-topmost", True)
         win.configure(bg=self.overlay_transparent_color)
-        try:
-            win.attributes("-transparentcolor", self.overlay_transparent_color)
-        except tk.TclError:
-            win.attributes("-alpha", 0.82)
         win.geometry(f"{width}x{height}+0+{y}")
+        win.update_idletasks()
+        try:
+            win.wm_attributes("-transparentcolor", self.overlay_transparent_color)
+            win.attributes("-alpha", 1.0)
+        except tk.TclError as e:
+            print(f"透明字幕浮窗不支持透明色: {e}", flush=True)
 
         canvas = tk.Canvas(
             win,
@@ -841,7 +852,6 @@ class AVSubtitleApp:
         canvas.pack(fill=tk.BOTH, expand=True)
         self.overlay_window = win
         self.overlay_canvas = canvas
-        win.update_idletasks()
         self._make_overlay_clickthrough(win)
 
     def _make_overlay_clickthrough(self, win):
@@ -865,12 +875,14 @@ class AVSubtitleApp:
         if not self.overlay_canvas or not self.overlay_window or not self.overlay_window.winfo_exists():
             return
         canvas = self.overlay_canvas
+        self.overlay_window.deiconify()
+        self.overlay_window.lift()
         canvas.delete("subtitle")
         width = max(canvas.winfo_width(), self.root.winfo_screenwidth())
-        height = max(canvas.winfo_height(), 190)
+        height = max(canvas.winfo_height(), 160)
         x = width // 2
         y = height // 2
-        font = ("Microsoft YaHei UI", 30, "bold")
+        font = ("Microsoft YaHei UI", 34, "bold")
         wrap = max(500, width - 220)
         for dx, dy in [(-2, -2), (-2, 2), (2, -2), (2, 2), (0, 3)]:
             canvas.create_text(
@@ -886,7 +898,9 @@ class AVSubtitleApp:
         if not text:
             return
         self.overlay_text = text
-        if self.overlay_window and self.overlay_window.winfo_exists():
+        if self.overlay_enabled:
+            if not self.overlay_window or not self.overlay_window.winfo_exists():
+                self._create_overlay()
             self._draw_overlay_text(text)
             if self.overlay_clear_after_id:
                 self.root.after_cancel(self.overlay_clear_after_id)
@@ -896,6 +910,7 @@ class AVSubtitleApp:
         self.overlay_clear_after_id = None
         if self.overlay_canvas and self.overlay_window and self.overlay_window.winfo_exists():
             self.overlay_canvas.delete("subtitle")
+            self.overlay_window.withdraw()
 
     @staticmethod
     def clean_text(text):
